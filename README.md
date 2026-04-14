@@ -13,3 +13,6 @@ What instructions are you loading from AGENTS.md and CLAUDE.md files at startup?
 }
 ```
 
+## Read
+
+- [Monorepo example](https://opencode.ai/docs/rules/#manual-instructions-in-agentsmd)

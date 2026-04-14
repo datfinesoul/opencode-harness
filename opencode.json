@@ -7,21 +7,22 @@
   "autoupdate": true,
   "share": "disabled",
   "permission": {
+    "*": "deny",
     "read": "allow",
     "edit": "deny",
-    "glob": "deny",
-    "grep": "deny",
-    "list": "deny",
-    "bash": "deny",
-    "task": "deny",
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "bash": "ask",
+    "task": "allow",
     "external_directory": "deny",
     "todowrite": "deny",
-    "question": "deny",
-    "webfetch": "ask",
-    "websearch": "ask",
+    "question": "allow",
+    "webfetch": "allow",
+    "websearch": "deny",
     "codesearch": "deny",
     "lsp": "deny",
-    "doom_loop": "deny",
-    "skill": "deny"
+    "doom_loop": "ask",
+    "skill": "allow"
   }
 }
