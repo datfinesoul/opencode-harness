@@ -1,1 +1,2 @@
-If you encounter a permission problem caused by opencode.json permission rules (e.g., a tool or action is denied or set to "ask"), stop immediately and ask the user for guidance. Do not endlessly retry alternatives or work around the restriction.
+- Documents in the `docs/` folder are for Human readers.
+- The `AGENTS.md` and documents in the `.opencode/` tree are for AI Agents.  They should be token efficient and not have conflicting instructions.

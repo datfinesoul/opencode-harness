@@ -1,0 +1,1 @@
+If you encounter a permission problem caused by opencode.json permission rules (e.g., a tool or action is denied or set to "ask"), stop immediately and ask the user for guidance. Do not endlessly retry alternatives or work around the restriction.
