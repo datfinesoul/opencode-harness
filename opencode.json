@@ -6,9 +6,44 @@
   "model": "opencode-go/minimax-m2.7",
   "autoupdate": true,
   "share": "disabled",
+  "default_agent": "general",
+  "agent": {
+    "general": {
+      "description": "Primary agent for general tasks",
+      "mode": "primary",
+      "permission": {
+        "read": "allow",
+        "edit": "deny",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": "ask",
+        "task": "allow",
+        "external_directory": "deny",
+        "todowrite": "deny",
+        "question": "allow",
+        "webfetch": "allow",
+        "websearch": "deny",
+        "codesearch": "deny",
+        "lsp": "deny",
+        "doom_loop": "ask",
+        "skill": "allow"
+      }
+    },
+    "build": {
+      "disable": true
+    },
+    "plan": {
+      "disable": true
+    }
+  },
   "permission": {
+    "*": "deny",
     "read": "allow",
-    "edit": "deny",
+    "edit": {
+      "*": "deny",
+      "opencode.json": "allow"
+    },
     "glob": "allow",
     "grep": "allow",
     "list": "allow",
