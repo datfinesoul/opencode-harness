@@ -1,0 +1,3 @@
+- Monorepo + Submodule Mix
+- Root is harness
+- Need to define external vs internal

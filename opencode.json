@@ -7,7 +7,6 @@
   "autoupdate": true,
   "share": "disabled",
   "permission": {
-    "*": "deny",
     "read": "allow",
     "edit": "deny",
     "glob": "allow",

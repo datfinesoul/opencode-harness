@@ -16,3 +16,19 @@ What instructions are you loading from AGENTS.md and CLAUDE.md files at startup?
 ## Read
 
 - [Monorepo example](https://opencode.ai/docs/rules/#manual-instructions-in-agentsmd)
+
+## Know Bugs
+
+- https://github.com/anomalyco/opencode/issues/20307
+
+  Permission module override after * not working
+
+  ```json
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "permission": {
+      "*": "ask",
+      "read": "allow"
+    }
+  }
+  ```
