@@ -1,2 +1,3 @@
+- If a tool call fails due to an opencode permission issue you MUST immediately inform the user and stop.
 - Documents in the `docs/` folder are for Human readers.
 - The `AGENTS.md` and documents in the `.opencode/` tree are for AI Agents.  They should be token efficient and not have conflicting instructions.

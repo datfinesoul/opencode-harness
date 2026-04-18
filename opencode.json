@@ -13,7 +13,10 @@
       "mode": "primary",
       "permission": {
         "read": "allow",
-        "edit": "deny",
+        "edit": {
+          "*": "deny",
+          "opencode.json": "allow"
+        },
         "glob": "allow",
         "grep": "allow",
         "list": "allow",
@@ -31,32 +34,146 @@
       }
     },
     "build": {
-      "disable": true
+      "description": "Default primary agent with full tool access",
+      "mode": "primary",
+      "disable": true,
+      "permission": {
+        "read": "allow",
+        "edit": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": "allow",
+        "task": "allow",
+        "skill": "allow",
+        "lsp": "allow",
+        "question": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "codesearch": "allow",
+        "external_directory": "allow",
+        "doom_loop": "ask",
+        "todowrite": "allow"
+      }
     },
     "plan": {
-      "disable": true
+      "description": "Restricted primary agent for analysis without making changes",
+      "mode": "primary",
+      "disable": true,
+      "permission": {
+        "read": "allow",
+        "edit": {
+          "*": "ask"
+        },
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": {
+          "*": "ask"
+        },
+        "task": "allow",
+        "skill": "allow",
+        "lsp": "allow",
+        "question": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "codesearch": "allow",
+        "external_directory": "ask",
+        "doom_loop": "ask",
+        "todowrite": "deny"
+      }
+    },
+    "explore": {
+      "description": "Fast read-only agent for exploring codebases",
+      "mode": "subagent",
+      "permission": {
+        "read": "allow",
+        "edit": "deny",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": "deny",
+        "task": "deny",
+        "skill": "allow",
+        "lsp": "allow",
+        "question": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "codesearch": "allow",
+        "external_directory": "ask",
+        "doom_loop": "ask",
+        "todowrite": "deny"
+      }
+    },
+    "compaction": {
+      "description": "System agent that compacts long context into summaries",
+      "mode": "primary",
+      "hidden": true,
+      "permission": {
+        "read": "allow",
+        "edit": "deny",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": "deny",
+        "task": "deny",
+        "skill": "deny",
+        "lsp": "deny",
+        "question": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "codesearch": "deny",
+        "external_directory": "deny",
+        "doom_loop": "deny",
+        "todowrite": "deny"
+      }
+    },
+    "title": {
+      "description": "System agent that generates short session titles",
+      "mode": "primary",
+      "hidden": true,
+      "permission": {
+        "read": "allow",
+        "edit": "deny",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": "deny",
+        "task": "deny",
+        "skill": "deny",
+        "lsp": "deny",
+        "question": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "codesearch": "deny",
+        "external_directory": "deny",
+        "doom_loop": "deny",
+        "todowrite": "deny"
+      }
+    },
+    "summary": {
+      "description": "System agent that creates session summaries",
+      "mode": "primary",
+      "hidden": true,
+      "permission": {
+        "read": "allow",
+        "edit": "deny",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": "deny",
+        "task": "deny",
+        "skill": "deny",
+        "lsp": "deny",
+        "question": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "codesearch": "deny",
+        "external_directory": "deny",
+        "doom_loop": "deny",
+        "todowrite": "deny"
+      }
     }
   },
-  "permission": {
-    "*": "deny",
-    "read": "allow",
-    "edit": {
-      "*": "deny",
-      "opencode.json": "allow"
-    },
-    "glob": "allow",
-    "grep": "allow",
-    "list": "allow",
-    "bash": "ask",
-    "task": "allow",
-    "external_directory": "deny",
-    "todowrite": "deny",
-    "question": "allow",
-    "webfetch": "allow",
-    "websearch": "deny",
-    "codesearch": "deny",
-    "lsp": "deny",
-    "doom_loop": "ask",
-    "skill": "allow"
-  }
+  "permission": {}
 }
