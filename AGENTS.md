@@ -1,3 +1,4 @@
 - If a tool call fails due to an opencode permission issue you MUST immediately inform the user and stop.
-- Documents in the `docs/` folder are for Human readers.
-- The `AGENTS.md` and documents in the `.opencode/` tree are for AI Agents.  They should be token efficient and not have conflicting instructions.
+- Documents in the `docs/` folder are for Human readers. NEVER create document for AI Agents in this folder.
+- The `AGENTS.md` and documents in the `.opencode/` tree are for AI Agents.  They should be token efficient and not have conflicting instructions. NEVER create documents specifically for Humans in `.opencode/`
+- ALWAYS run the following on EVERY `.json` file after you edit or create it. `diff <(jq . THE_FILE_NAME) THE_FILE_NAME`. If the result is not what expected, correct it and check again.
