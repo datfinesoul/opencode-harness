@@ -1,56 +1,105 @@
-# AWS ECS EC2 with ADOT Instrumentation for Node.js
+# AWS ECS EC2 with ADOT / Observe Agent + Observe Inc for Node.js
 
-**Sources:** AWS Distro for OpenTelemetry official docs, OpenTelemetry JS upstream docs  
-**Context:** EC2-backed ECS cluster, Node.js test API service, OpenTofu provisioning
+**Sources:** AWS Distro for OpenTelemetry official docs, Observe Inc official docs, OpenTelemetry JS upstream docs  
+**Context:** EC2-backed ECS cluster, Node.js test API service, OpenTofu provisioning, Observe Inc as observability backend
 
 ---
 
 ## Overview
 
-AWS Distro for OpenTelemetry (ADOT) is AWS's distribution of the OpenTelemetry Collector and SDKs. For ECS on EC2, the canonical pattern is:
+There are two viable collection approaches for sending telemetry to Observe Inc from ECS EC2:
 
-1. Run the ADOT Collector as a **sidecar container** in the same ECS task as your Node.js app.
-2. Instrument your Node.js app to export OTLP telemetry to the sidecar at `localhost:4317` (gRPC) or `localhost:4318` (HTTP).
-3. The ADOT Collector forwards traces to X-Ray, metrics to CloudWatch (via EMF), and container metrics via the `awsecscontainermetrics` receiver.
+| Approach | Collector Image | Best For |
+|---|---|---|
+| **Observe Agent (recommended)** | `observeinc/observe-agent` | Purpose-built for Observe, pre-configured exporters, built-in Observe package routing |
+| **Vanilla ADOT + OTLP exporter** | `amazon/aws-otel-collector` | Teams already invested in ADOT config, or needing AWS-native resources (X-Ray, etc.) alongside Observe |
 
-Optionally, run the ADOT Collector as a **daemon service** on each EC2 instance to collect EC2-level host metrics (CPU, disk, network).
+Both options use the **sidecar pattern** on ECS EC2: the collector runs as a container in the same task as your Node.js app. The Node.js app sends OTLP to `localhost`/container-name, and the collector forwards to Observe.
+
+**Key difference from a CloudWatch-only setup:** You replace `awsxray` and `awsemf` exporters with `otlphttp` exporters pointed at `https://<customer_id>.collect.observeinc.com/v2/otel`. Observe natively ingests OTLP HTTP (protobuf). OTLP gRPC is **not** supported at Observe's ingest endpoint — the collector must use HTTP to reach Observe, but can still accept gRPC from local app containers.
+
+For EC2 host-level and container log collection, the Observe Agent also runs as a **daemon service** on each EC2 instance.
 
 ---
 
 ## Architecture
 
 ```
-┌────────────────────────────── ECS Task ───────────────────────────────┐
+┌────────────────────────────── ECS Task (bridge mode) ─────────────────┐
 │                                                                        │
 │  ┌──────────────────────────┐      ┌───────────────────────────────┐  │
-│  │  Node.js API container   │      │   ADOT Collector (sidecar)    │  │
-│  │                          │      │   image: amazon/aws-otel-     │  │
-│  │  NODE_OPTIONS=           │─────▶│           collector           │  │
-│  │  --require @aws/adot...  │ OTLP │                               │  │
-│  │  (port 3000)             │      │  receivers: [otlp, xray,      │  │
-│  │                          │      │    awsecscontainermetrics,    │  │
-│  └──────────────────────────┘      │    statsd]                    │  │
-│                                    │                               │  │
-│                                    │  exporters: [awsxray, awsemf] │  │
+│  │  Node.js API container   │      │   Observe Agent (sidecar)     │  │
+│  │                          │      │   image: observeinc/          │  │
+│  │  NODE_OPTIONS=           │─────▶│           observe-agent       │  │
+│  │  --require @otel/auto... │OTLP  │                               │  │
+│  │  (port 3000)             │HTTP  │  receivers: [otlp,            │  │
+│  │                          │      │    awsecscontainermetrics]    │  │
+│  └──────────────────────────┘      │                               │  │
+│                                    │  exporters:                   │  │
+│                                    │   otlphttp/observe (traces)   │  │
+│                                    │   otlphttp/observemetrics     │  │
 │                                    └──────────┬────────────────────┘  │
 └───────────────────────────────────────────────│───────────────────────┘
-                                                │
-                              ┌─────────────────┴──────────────┐
-                              │                                 │
-                         AWS X-Ray                    CloudWatch (EMF)
-                         (traces)                     (metrics + container
-                                                        insights)
+                                                │ OTLP/HTTP + Bearer token
+                                  ┌─────────────▼──────────────────────┐
+                                  │  Observe Inc                       │
+                                  │  https://<id>.collect.observeinc   │
+                                  │  .com/v2/otel                      │
+                                  │                                    │
+                                  │  - Trace Explorer (APM)            │
+                                  │  - Metrics Explorer                │
+                                  │  - Log Explorer                    │
+                                  └────────────────────────────────────┘
 ```
 
-For EC2 host-level metrics, also deploy the collector as a daemon service:
+For EC2-level host metrics and container logs (daemon pattern):
 
 ```
 ECS Cluster (EC2)
-├── Daemon Service: ADOT Collector
-│   └── Collects EC2 instance metrics → CloudWatch
-└── Application Service (1..N tasks)
-    └── Each task: Node.js app + ADOT sidecar
+├── Daemon Service: observe-agent (host network mode)
+│   └── Collects: docker logs, host metrics → Observe
+└── Application Services (1..N tasks, bridge mode)
+    └── Each task: Node.js app + observe-agent sidecar
 ```
+
+---
+
+## Observe Inc Ingest Basics
+
+### OTLP Endpoint
+
+```
+https://<CUSTOMER_ID>.collect.observeinc.com/v2/otel
+```
+
+The agent appends the appropriate path suffix per signal type automatically:
+- Traces: `.../v2/otel/v1/traces`
+- Metrics: `.../v2/otel/v1/metrics`
+- Logs: `.../v2/otel/v1/logs`
+
+### Authentication
+
+All requests require a Bearer token in the `Authorization` header:
+
+```
+Authorization: Bearer <INGEST_TOKEN>
+```
+
+Ingest tokens are created in **Data & Integrations > Add Data** in the Observe UI.
+
+### Protocol
+
+Observe supports OTLP over **HTTP only** (no gRPC at the ingest boundary). Use `http/protobuf` encoding. JSON encoding (`application/json`) is also accepted. Maximum payload: 50MB uncompressed, 10MB compressed.
+
+### `x-observe-target-package` Header
+
+Observe uses an optional routing header to associate incoming telemetry with a specific Observe app/package:
+
+| Signal | Header Value |
+|---|---|
+| Traces/APM | `Tracing` |
+| Metrics | `Metrics` |
+| Logs | `Host Explorer` |
 
 ---
 
@@ -58,19 +107,21 @@ ECS Cluster (EC2)
 
 ### Node.js Version Requirements
 
-ADOT JavaScript auto-instrumentation supports Node.js **18, 20, 22, and 24**.
+OpenTelemetry JavaScript auto-instrumentation supports Node.js **18, 20, 22, and 24**.
 
 ### ECS Agent Version
 
-The `awsecscontainermetrics` receiver requires ECS agent **v1.39.0+** (EC2 launch type) to use Task Metadata Endpoint V4.
+The `awsecscontainermetrics` receiver requires ECS agent **v1.39.0+** (EC2) to access Task Metadata Endpoint V4.
 
 ---
 
 ## Step 1: IAM Setup
 
-### 1.1 Task IAM Policy (`AWSDistroOpenTelemetryPolicy`)
+### 1.1 Task Role Permissions
 
-Create a custom policy granting the ADOT Collector access to write to X-Ray, CloudWatch, and read SSM parameters:
+The Observe Agent only needs to call AWS APIs for metadata enrichment and container metrics. Unlike the pure ADOT/CloudWatch approach, you do **not** need X-Ray or CloudWatch metrics permissions.
+
+Minimum permissions for the ECS task role:
 
 ```json
 {
@@ -79,21 +130,15 @@ Create a custom policy granting the ADOT Collector access to write to X-Ray, Clo
     {
       "Effect": "Allow",
       "Action": [
-        "logs:PutLogEvents",
         "logs:CreateLogGroup",
         "logs:CreateLogStream",
-        "logs:DescribeLogStreams",
+        "logs:PutLogEvents",
         "logs:DescribeLogGroups",
-        "logs:PutRetentionPolicy",
-        "xray:PutTraceSegments",
-        "xray:PutTelemetryRecords",
-        "xray:GetSamplingRules",
-        "xray:GetSamplingTargets",
-        "xray:GetSamplingStatisticSummaries",
-        "cloudwatch:PutMetricData",
-        "ec2:DescribeVolumes",
-        "ec2:DescribeTags",
-        "ssm:GetParameters"
+        "logs:DescribeLogStreams",
+        "ec2:DescribeRegions",
+        "ecs:DescribeTasks",
+        "ecs:ListTasks",
+        "ecs:DescribeContainerInstances"
       ],
       "Resource": "*"
     }
@@ -101,141 +146,98 @@ Create a custom policy granting the ADOT Collector access to write to X-Ray, Clo
 }
 ```
 
-### 1.2 TaskRole (`AWSOTTaskRole`)
+If you want to also retain AWS-native tracing via X-Ray (alongside Observe), add:
 
-- Trusted entity: **Elastic Container Service Task**
-- Attach: `AWSDistroOpenTelemetryPolicy` (created above)
+```json
+"xray:PutTraceSegments",
+"xray:PutTelemetryRecords",
+"xray:GetSamplingRules",
+"xray:GetSamplingTargets"
+```
 
-This is the role the running containers use to call AWS APIs.
+### 1.2 Task Execution Role
 
-### 1.3 TaskExecutionRole (`AWSOTTaskExecutionRole`)
+Standard ECS execution role. Attach:
+- `AmazonECSTaskExecutionRolePolicy` (pull images from ECR, write startup logs)
+- `CloudWatchLogsFullAccess` or scoped `logs:CreateLogStream` + `logs:PutLogEvents` for agent container logs
 
-- Trusted entity: **Elastic Container Service Task**
-- Attach:
-  - `AmazonECSTaskExecutionRolePolicy` (pull images, write CloudWatch logs)
-  - `CloudWatchLogsFullAccess`
-  - `AmazonSSMReadOnlyAccess` (needed if using SSM for custom collector config)
+If storing the Observe ingest token in **SSM Parameter Store** (recommended over plaintext env vars), also attach:
+- `AmazonSSMReadOnlyAccess`
 
-This role grants ECS the permissions needed to start your task (pull images, write startup logs).
+If storing in **AWS Secrets Manager**, add the appropriate `secretsmanager:GetSecretValue` permission.
 
 ---
 
-## Step 2: Node.js App Instrumentation
+## Step 2: Observe Agent Configuration
 
-### 2.1 Install ADOT JavaScript SDK
+### Option A: Observe Agent (Recommended)
 
-```bash
-npm install @aws/aws-distro-opentelemetry-node-autoinstrumentation
+The Observe Agent (`observeinc/observe-agent`) is a pre-configured OpenTelemetry Collector distribution built and maintained by Observe. It handles exporter configuration, retry logic, and Observe-specific routing headers automatically via the `token` and `observe_url` top-level config fields.
+
+**`observe-agent.yaml`** for ECS EC2 sidecar:
+
+```yaml
+# Observe ingest token
+token: "${TOKEN}"
+
+# Observe collection URL (include trailing slash)
+observe_url: "${OBSERVE_URL}"
+
+self_monitoring:
+  enabled: true
+
+host_monitoring:
+  enabled: false        # disabled in sidecar; enable in daemon service
+  logs:
+    enabled: false
+  metrics:
+    host:
+      enabled: false
+    process:
+      enabled: false
+
+forwarding:
+  enabled: true
+  metrics:
+    output_format: otel
+  endpoints:
+    grpc: 0.0.0.0:4317   # accepts from local Node.js app
+    http: 0.0.0.0:4318
+
+resource_attributes:
+  service.name: "${SERVICE_NAME}"
+  deployment.environment.name: "${ENVIRONMENT}"
+
+otel_config_overrides:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+    awsecscontainermetrics:
+      collection_interval: 20s
+
+  service:
+    pipelines:
+      metrics/ecs:
+        receivers: [awsecscontainermetrics]
+        processors: [memory_limiter, resourcedetection, resourcedetection/cloud, batch]
+        exporters: [otlphttp/observemetrics]
 ```
 
-This pulls in `@opentelemetry/auto-instrumentations-node`, `@opentelemetry/sdk-node`, and all required upstream packages. It auto-instruments Express, HTTP, AWS SDK, and many other popular libraries.
+**Key points:**
+- `token` and `observe_url` are the only required fields — the agent auto-configures OTLP exporters with correct authentication headers.
+- `otel_config_overrides` merges with the agent's built-in pipeline config rather than replacing it entirely.
+- The `awsecscontainermetrics` pipeline is added via `otel_config_overrides` to collect ECS container metrics.
+- `resourcedetection` and `resourcedetection/cloud` processors automatically enrich spans/metrics with ECS metadata (cluster name, task ARN, container name, AWS region, etc.).
 
-### 2.2 Enable Auto-Instrumentation
+### Option B: Vanilla ADOT Collector with Observe OTLP Exporter
 
-The simplest approach — no code changes to `app.js`:
+If you are using `amazon/aws-otel-collector` (the ADOT image) rather than the Observe Agent, replace the `awsxray` and `awsemf` exporters with `otlphttp` exporters targeting Observe. Store the ingest token in SSM and inject via `AOT_CONFIG_CONTENT`.
 
-```bash
-# Set in ECS task definition environment or Dockerfile
-NODE_OPTIONS="--require @aws/aws-distro-opentelemetry-node-autoinstrumentation/register"
-```
-
-Or explicitly at launch:
-
-```bash
-node --require '@aws/aws-distro-opentelemetry-node-autoinstrumentation/register' app.js
-```
-
-### 2.3 Required Environment Variables for ECS
-
-Set these on the **Node.js container** in the task definition:
-
-| Variable | Value | Purpose |
-|---|---|---|
-| `NODE_OPTIONS` | `--require @aws/aws-distro-opentelemetry-node-autoinstrumentation/register` | Loads auto-instrumentation |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | OTLP gRPC to sidecar |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` | Protocol selection |
-| `OTEL_RESOURCE_ATTRIBUTES` | `service.name=my-nodejs-api,service.version=1.0` | Service identity in traces/metrics |
-| `OTEL_PROPAGATORS` | `xray,tracecontext,b3` | AWS X-Ray trace propagation |
-| `OTEL_TRACES_SAMPLER` | `parentbased_traceidratio` | Sampling strategy |
-| `OTEL_TRACES_SAMPLER_ARG` | `1.0` | 100% sampling (reduce in production) |
-
-For **X-Ray remote sampling** (sampling rules managed centrally):
-
-```
-OTEL_TRACES_SAMPLER=xray
-OTEL_TRACES_SAMPLER_ARG=endpoint=http://localhost:2000,polling_interval=300
-```
-
-The sidecar must expose port 2000 (UDP) for the X-Ray receiver to support remote sampling.
-
-### 2.4 Manual Instrumentation (Optional)
-
-For custom spans alongside auto-instrumentation:
-
-```bash
-npm install @opentelemetry/api
-```
-
-```js
-const { trace } = require('@opentelemetry/api');
-
-const tracer = trace.getTracer('my-service');
-
-async function doWork() {
-  return tracer.startActiveSpan('my-custom-span', async (span) => {
-    span.setAttribute('custom.key', 'value');
-    try {
-      // ... work ...
-    } finally {
-      span.end();
-    }
-  });
-}
-```
-
----
-
-## Step 3: ADOT Collector Configuration
-
-The ADOT Collector image (`amazon/aws-otel-collector`) ships with two built-in configs for ECS:
-
-| Config Path | Use Case |
-|---|---|
-| `--config=/etc/ecs/ecs-default-config.yaml` | StatsD metrics, OTLP metrics/traces, X-Ray SDK traces |
-| `--config=/etc/ecs/container-insights/otel-task-metrics-config.yaml` | All of the above + ECS container resource utilization metrics |
-
-**For a Node.js API with full observability, use the Container Insights config.**
-
-### 3.1 Built-in Container Insights Config (Recommended Starting Point)
-
-Pass this as the `command` in the ADOT container definition:
-
-```json
-"command": ["--config=/etc/ecs/container-insights/otel-task-metrics-config.yaml"]
-```
-
-This built-in config wires up:
-- `receivers`: `otlp`, `awsxray` (UDP 2000), `awsecscontainermetrics`, `statsd`
-- `exporters`: `awsxray`, `awsemf` (CloudWatch via EMF)
-
-### 3.2 Custom Config via SSM Parameter (Production Pattern)
-
-For production, store your collector config in AWS SSM Parameter Store and reference it via environment variable. This avoids rebuilding the collector image when config changes.
-
-**SSM Parameter:**
-- Name: `otel-collector-config`
-- Type: String
-- Value: full YAML collector config (see below)
-
-**ADOT container environment variable:**
-```json
-{
-  "name": "AOT_CONFIG_CONTENT",
-  "valueFrom": "otel-collector-config"
-}
-```
-
-**Example custom config for Node.js + ECS EC2:**
+**Custom ADOT config for Observe:**
 
 ```yaml
 receivers:
@@ -245,9 +247,6 @@ receivers:
         endpoint: 0.0.0.0:4317
       http:
         endpoint: 0.0.0.0:4318
-  awsxray:
-    endpoint: 0.0.0.0:2000
-    transport: udp
   awsecscontainermetrics:
     collection_interval: 20s
 
@@ -255,120 +254,202 @@ processors:
   batch:
     timeout: 1s
     send_batch_size: 50
-  resource:
-    attributes:
-      - key: ClusterName
-        from_attribute: aws.ecs.cluster.name
-        action: insert
-      - key: aws.ecs.cluster.name
-        action: delete
-      - key: ServiceName
-        from_attribute: aws.ecs.service.name
-        action: insert
-      - key: aws.ecs.service.name
-        action: delete
-      - key: TaskId
-        from_attribute: aws.ecs.task.id
-        action: insert
-      - key: aws.ecs.task.id
-        action: delete
-      - key: TaskDefinitionFamily
-        from_attribute: aws.ecs.task.family
-        action: insert
-      - key: aws.ecs.task.family
-        action: delete
-  filter/container_metrics:
-    metrics:
-      include:
-        match_type: strict
-        metric_names:
-          - ecs.task.memory.reserved
-          - ecs.task.memory.utilized
-          - ecs.task.cpu.reserved
-          - ecs.task.cpu.utilized
-          - ecs.task.network.rate.rx
-          - ecs.task.network.rate.tx
-          - ecs.task.storage.read_bytes
-          - ecs.task.storage.write_bytes
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 200
+  resourcedetection:
+    detectors: [env, ecs, ec2]
+    timeout: 5s
 
 exporters:
-  awsxray:
-    region: us-east-1
-  awsemf:
-    region: us-east-1
-    namespace: ECS/ContainerInsights
-    log_group_name: '/aws/ecs/containerinsights/{ClusterName}/performance'
-    log_stream_name: '{TaskId}'
-    resource_to_telemetry_conversion:
+  otlphttp/observetraces:
+    endpoint: "${OBSERVE_URL}/v2/otel"
+    headers:
+      authorization: "Bearer ${OBSERVE_TOKEN}"
+      x-observe-target-package: "Tracing"
+    sending_queue:
+      num_consumers: 4
+      queue_size: 100
+    retry_on_failure:
       enabled: true
-    dimension_rollup_option: NoDimensionRollup
-    metric_declarations:
-      - dimensions: [[ClusterName], [ClusterName, TaskDefinitionFamily]]
-        metric_name_selectors: [.]
-  awsemf/application:
-    region: us-east-1
-    namespace: 'MyApp/NodeJS'
-    log_group_name: '/myapp/metrics'
-    resource_to_telemetry_conversion:
+    compression: zstd
+  otlphttp/observemetrics:
+    endpoint: "${OBSERVE_URL}/v2/otel"
+    headers:
+      authorization: "Bearer ${OBSERVE_TOKEN}"
+      x-observe-target-package: "Metrics"
+    sending_queue:
+      num_consumers: 4
+      queue_size: 100
+    retry_on_failure:
       enabled: true
+    compression: zstd
+  otlphttp/observelogs:
+    endpoint: "${OBSERVE_URL}/v2/otel"
+    headers:
+      authorization: "Bearer ${OBSERVE_TOKEN}"
+      x-observe-target-package: "Host Explorer"
+    sending_queue:
+      num_consumers: 4
+      queue_size: 100
+    retry_on_failure:
+      enabled: true
+    compression: zstd
 
 service:
   pipelines:
     traces:
-      receivers: [otlp, awsxray]
-      processors: [batch]
-      exporters: [awsxray]
-    metrics/container:
-      receivers: [awsecscontainermetrics]
-      processors: [filter/container_metrics, resource]
-      exporters: [awsemf]
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlphttp/observetraces]
     metrics/app:
       receivers: [otlp]
-      processors: [batch]
-      exporters: [awsemf/application]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlphttp/observemetrics]
+    metrics/ecs:
+      receivers: [awsecscontainermetrics]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlphttp/observemetrics]
+```
+
+Store this in SSM Parameter Store and reference via `AOT_CONFIG_CONTENT` env var on the ADOT container. See [SSM config delivery](#custom-config-delivery-ssm).
+
+---
+
+## Step 3: Node.js App Instrumentation
+
+Observe's own docs recommend the **upstream OpenTelemetry auto-instrumentation** (`@opentelemetry/auto-instrumentations-node`), not the AWS-specific ADOT package. Both work, but the upstream package is more portable.
+
+### 3.1 Install Dependencies
+
+```bash
+npm install --save @opentelemetry/api
+npm install --save @opentelemetry/auto-instrumentations-node
+```
+
+If you need the AWS-specific ADOT package (e.g., for X-Ray propagation alongside Observe):
+
+```bash
+npm install @aws/aws-distro-opentelemetry-node-autoinstrumentation
+```
+
+### 3.2 Environment Variables for ECS Task Definition
+
+Set on the **Node.js container**:
+
+| Variable | Value | Notes |
+|---|---|---|
+| `NODE_OPTIONS` | `--require @opentelemetry/auto-instrumentations-node/register` | Zero-code instrumentation |
+| `OTEL_SERVICE_NAME` | `nodejs-api` | Appears in Observe APM service map |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://observe-agent:4318` | HTTP endpoint on the sidecar (bridge mode uses container name) |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | Observe requires HTTP, not gRPC, at ingest |
+| `OTEL_RESOURCE_ATTRIBUTES` | `deployment.environment=test,service.version=1.0` | Enriches all telemetry |
+| `OTEL_PROPAGATORS` | `tracecontext,b3` | W3C trace context; use `xray,tracecontext` if also sending to X-Ray |
+| `OTEL_TRACES_SAMPLER` | `parentbased_traceidratio` | Head-based sampling |
+| `OTEL_TRACES_SAMPLER_ARG` | `1.0` | 100% for testing; tune down in production |
+
+**Important protocol note:** The Node.js app → sidecar leg can use gRPC (`4317`) or HTTP (`4318`). The sidecar → Observe leg **must** use HTTP. The Observe Agent handles this automatically. With vanilla ADOT, configure the `otlphttp` exporter (not `otlp`/gRPC) for Observe export.
+
+### 3.3 If Using ADOT SDK Instead
+
+```
+NODE_OPTIONS="--require @aws/aws-distro-opentelemetry-node-autoinstrumentation/register"
+OTEL_EXPORTER_OTLP_ENDPOINT=http://aws-otel-collector:4318
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+OTEL_PROPAGATORS=xray,tracecontext,b3
+```
+
+### 3.4 ESM Applications
+
+If your app uses ES Modules (`"type": "module"` in package.json), the `--require` flag won't patch instrumentation correctly. Use:
+
+```bash
+node --experimental-loader=@opentelemetry/instrumentation/hook.mjs \
+     --require @opentelemetry/auto-instrumentations-node/register \
+     app.js
+```
+
+In the task definition `NODE_OPTIONS`:
+
+```
+--experimental-loader=@opentelemetry/instrumentation/hook.mjs --require @opentelemetry/auto-instrumentations-node/register
 ```
 
 ---
 
-## Step 4: ECS Task Definition (EC2)
+## Step 4: Build and Push the Observe Agent Image
 
-The core pattern for EC2 launch type is `bridge` network mode with `links` connecting containers. The Node.js container links to the `aws-otel-collector` container.
+The Observe Agent configuration is baked into a custom Docker image pushed to ECR. This is the pattern used in Observe's official ECS EC2 docs.
+
+### 4.1 Prepare Configuration File
+
+Create `observe-agent.yaml` (from Step 2 above). Use `${TOKEN}` and `${OBSERVE_URL}` as placeholders — these are injected at runtime via ECS environment variables.
+
+### 4.2 Dockerfile
+
+```dockerfile
+FROM observeinc/observe-agent:latest
+COPY observe-agent.yaml /etc/observe-agent/observe-agent.yaml
+```
+
+> For production, pin to a specific version instead of `latest`. Check releases at https://github.com/observeinc/observe-agent/releases
+
+### 4.3 Build and Push to ECR
+
+```bash
+# Build (must target amd64 for ECS EC2)
+docker buildx build --platform=linux/amd64 -t observe-agent:latest .
+
+# Create ECR repository (first time only)
+aws ecr create-repository --repository-name observe/observe-agent --region <your_region>
+
+# Authenticate and push
+aws ecr get-login-password --region <your_region> \
+  | docker login --username AWS --password-stdin \
+    <your_account_id>.dkr.ecr.<your_region>.amazonaws.com
+
+docker tag observe-agent:latest \
+  <your_account_id>.dkr.ecr.<your_region>.amazonaws.com/observe/observe-agent:latest
+
+docker push \
+  <your_account_id>.dkr.ecr.<your_region>.amazonaws.com/observe/observe-agent:latest
+```
+
+---
+
+## Step 5: ECS Task Definition (EC2, Bridge Mode)
 
 ```json
 {
-  "family": "nodejs-api-with-adot",
-  "taskRoleArn": "<AWSOTTaskRole ARN>",
-  "executionRoleArn": "<AWSOTTaskExecutionRole ARN>",
+  "family": "nodejs-api-with-observe",
+  "taskRoleArn": "arn:aws:iam::<account_id>:role/<task-role>",
+  "executionRoleArn": "arn:aws:iam::<account_id>:role/<execution-role>",
   "networkMode": "bridge",
   "requiresCompatibilities": ["EC2"],
   "cpu": "512",
   "memory": "1024",
   "containerDefinitions": [
     {
-      "name": "aws-otel-collector",
-      "image": "amazon/aws-otel-collector",
+      "name": "observe-agent",
+      "image": "<account_id>.dkr.ecr.<region>.amazonaws.com/observe/observe-agent:latest",
       "essential": true,
-      "command": [
-        "--config=/etc/ecs/container-insights/otel-task-metrics-config.yaml"
-      ],
+      "cpu": 256,
+      "memory": 512,
       "portMappings": [
         { "hostPort": 4317, "containerPort": 4317, "protocol": "tcp" },
-        { "hostPort": 4318, "containerPort": 4318, "protocol": "tcp" },
-        { "hostPort": 2000, "containerPort": 2000, "protocol": "udp" },
-        { "hostPort": 8125, "containerPort": 8125, "protocol": "udp" }
+        { "hostPort": 4318, "containerPort": 4318, "protocol": "tcp" }
       ],
-      "healthCheck": {
-        "command": ["/healthcheck"],
-        "interval": 5,
-        "timeout": 6,
-        "retries": 5,
-        "startPeriod": 1
-      },
+      "environment": [
+        { "name": "TOKEN",       "value": "<YOUR_INGEST_TOKEN>" },
+        { "name": "OBSERVE_URL", "value": "https://<customer_id>.collect.observeinc.com/" },
+        { "name": "SERVICE_NAME", "value": "nodejs-api" },
+        { "name": "ENVIRONMENT",  "value": "test" }
+      ],
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
-          "awslogs-group": "/ecs/adot-collector",
-          "awslogs-region": "us-east-1",
+          "awslogs-group": "/ecs/observe-agent",
+          "awslogs-region": "<region>",
           "awslogs-stream-prefix": "ecs",
           "awslogs-create-group": "True"
         }
@@ -376,11 +457,13 @@ The core pattern for EC2 launch type is `bridge` network mode with `links` conne
     },
     {
       "name": "nodejs-api",
-      "image": "<your-ecr-image>",
+      "image": "<account_id>.dkr.ecr.<region>.amazonaws.com/nodejs-api:latest",
       "essential": true,
-      "links": ["aws-otel-collector"],
+      "cpu": 256,
+      "memory": 512,
+      "links": ["observe-agent"],
       "dependsOn": [
-        { "containerName": "aws-otel-collector", "condition": "START" }
+        { "containerName": "observe-agent", "condition": "START" }
       ],
       "portMappings": [
         { "hostPort": 3000, "containerPort": 3000, "protocol": "tcp" }
@@ -388,23 +471,27 @@ The core pattern for EC2 launch type is `bridge` network mode with `links` conne
       "environment": [
         {
           "name": "NODE_OPTIONS",
-          "value": "--require @aws/aws-distro-opentelemetry-node-autoinstrumentation/register"
+          "value": "--require @opentelemetry/auto-instrumentations-node/register"
+        },
+        {
+          "name": "OTEL_SERVICE_NAME",
+          "value": "nodejs-api"
         },
         {
           "name": "OTEL_EXPORTER_OTLP_ENDPOINT",
-          "value": "http://aws-otel-collector:4317"
+          "value": "http://observe-agent:4318"
         },
         {
           "name": "OTEL_EXPORTER_OTLP_PROTOCOL",
-          "value": "grpc"
+          "value": "http/protobuf"
         },
         {
           "name": "OTEL_RESOURCE_ATTRIBUTES",
-          "value": "service.name=nodejs-api,service.version=1.0"
+          "value": "deployment.environment=test,service.version=1.0"
         },
         {
           "name": "OTEL_PROPAGATORS",
-          "value": "xray,tracecontext,b3"
+          "value": "tracecontext,b3"
         },
         {
           "name": "OTEL_TRACES_SAMPLER",
@@ -419,7 +506,7 @@ The core pattern for EC2 launch type is `bridge` network mode with `links` conne
         "logDriver": "awslogs",
         "options": {
           "awslogs-group": "/ecs/nodejs-api",
-          "awslogs-region": "us-east-1",
+          "awslogs-region": "<region>",
           "awslogs-stream-prefix": "ecs",
           "awslogs-create-group": "True"
         }
@@ -429,100 +516,216 @@ The core pattern for EC2 launch type is `bridge` network mode with `links` conne
 }
 ```
 
-**Key EC2 networking notes:**
-- `networkMode: "bridge"` is standard for EC2 ECS tasks.
-- In bridge mode, containers in the same task communicate via Docker `links` using the container name as hostname (e.g., `http://aws-otel-collector:4317`).
-- `awsvpc` mode is an alternative that assigns each task its own ENI; in that case `localhost` works for inter-container communication but requires different port mapping.
+**EC2 bridge mode networking notes:**
+- Containers in the same task communicate via Docker `links`. The Node.js container uses `http://observe-agent:4318` as the OTLP endpoint.
+- In `awsvpc` network mode (alternative), use `http://localhost:4318` — no `links` needed, but each task gets its own ENI.
+- `dependsOn: START` ensures the agent is listening before Node.js starts.
 
 ---
 
-## Step 5: EC2 Instance-Level Metrics (Daemon Service)
+## Step 6: Daemon Service for EC2 Host Metrics and Container Logs
 
-To collect host-level EC2 metrics (not just task/container metrics), deploy the ADOT Collector as a **daemon service** — one instance per EC2 instance in the cluster.
+To collect docker container logs and EC2 host-level metrics, deploy the Observe Agent as a **daemon service** — one task per EC2 instance.
 
-### 5.1 Daemon Task Definition
+The daemon agent config enables `host_monitoring` and uses `filelog` receivers to tail Docker log files via a host volume mount.
+
+### 6.1 Daemon `observe-agent.yaml`
+
+```yaml
+token: "${TOKEN}"
+observe_url: "${OBSERVE_URL}"
+
+self_monitoring:
+  enabled: true
+
+host_monitoring:
+  enabled: true
+  logs:
+    enabled: true
+    include: []
+  metrics:
+    host:
+      enabled: true
+    process:
+      enabled: false
+
+forwarding:
+  enabled: false   # not acting as a forwarding sidecar
+
+otel_config_overrides:
+  receivers:
+    filelog/ecs:
+      include: [/var/lib/docker/containers/**/*.log]
+      include_file_path: true
+      storage: file_storage
+      retry_on_failure:
+        enabled: true
+      max_log_size: 4MiB
+
+  service:
+    pipelines:
+      logs/ecs:
+        receivers: [filelog/ecs]
+        processors: [memory_limiter, resourcedetection, resourcedetection/cloud, batch]
+        exporters: [otlphttp/observe]
+```
+
+### 6.2 Daemon Task Definition
 
 ```json
 {
-  "family": "adot-daemon-ec2",
-  "taskRoleArn": "<AWSOTTaskRole ARN>",
-  "executionRoleArn": "<AWSOTTaskExecutionRole ARN>",
-  "networkMode": "host",
+  "family": "observe-agent-daemon",
+  "taskRoleArn": "arn:aws:iam::<account_id>:role/<task-role>",
+  "executionRoleArn": "arn:aws:iam::<account_id>:role/<execution-role>",
+  "networkMode": "bridge",
   "requiresCompatibilities": ["EC2"],
   "containerDefinitions": [
     {
-      "name": "aws-otel-collector",
-      "image": "amazon/aws-otel-collector",
+      "name": "observe-agent",
+      "image": "<account_id>.dkr.ecr.<region>.amazonaws.com/observe/observe-agent:latest",
       "essential": true,
-      "command": ["--config=/etc/ecs/container-insights/otel-task-metrics-config.yaml"],
+      "cpu": 256,
+      "memory": 512,
+      "environment": [
+        { "name": "TOKEN",       "value": "<YOUR_INGEST_TOKEN>" },
+        { "name": "OBSERVE_URL", "value": "https://<customer_id>.collect.observeinc.com/" }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "docker_logs",
+          "containerPath": "/var/lib/docker/containers",
+          "readOnly": true
+        },
+        {
+          "sourceVolume": "docker_sock",
+          "containerPath": "/var/run/docker.sock",
+          "readOnly": true
+        }
+      ],
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
-          "awslogs-group": "/ecs/adot-daemon",
-          "awslogs-region": "us-east-1",
-          "awslogs-stream-prefix": "daemon",
-          "awslogs-create-group": "True"
+          "awslogs-group": "/aws/ecs/observe/observe-agent",
+          "awslogs-region": "<region>",
+          "awslogs-stream-prefix": "ecs"
         }
       }
+    }
+  ],
+  "volumes": [
+    {
+      "name": "docker_logs",
+      "host": { "sourcePath": "/var/lib/docker/containers" }
+    },
+    {
+      "name": "docker_sock",
+      "host": { "sourcePath": "/var/run/docker.sock" }
     }
   ]
 }
 ```
 
-### 5.2 Deploy as Daemon
-
-Via AWS CLI:
+### 6.3 Deploy as Daemon
 
 ```bash
 aws ecs create-service \
-  --cluster my-cluster \
-  --service-name adot-daemon \
-  --task-definition adot-daemon-ec2 \
-  --scheduling-strategy DAEMON
+  --cluster <cluster-name> \
+  --service-name observe-agent-daemon \
+  --task-definition observe-agent-daemon \
+  --scheduling-strategy DAEMON \
+  --region <region>
 ```
 
 ---
 
-## Step 6: Collector Image Tags and Updates
+## Step 7: Securing the Ingest Token
 
-The ADOT Collector image is hosted on Docker Hub and ECR Public:
+### Option A: SSM Parameter Store (Simple)
 
-```
-amazon/aws-otel-collector:latest
-amazon/aws-otel-collector:v0.x.y   # pin to specific version in production
+```bash
+aws ssm put-parameter \
+  --name "/observe/ingest-token" \
+  --value "<YOUR_INGEST_TOKEN>" \
+  --type SecureString \
+  --region <region>
 ```
 
-ECR Public (preferred for ECS to avoid Docker Hub rate limits):
+In the task definition, use `valueFrom` instead of `value`:
 
+```json
+{
+  "name": "TOKEN",
+  "valueFrom": "arn:aws:ssm:<region>:<account_id>:parameter/observe/ingest-token"
+}
 ```
-public.ecr.aws/aws-observability/aws-otel-collector:latest
+
+The task execution role needs `ssm:GetParameters` permission on that parameter ARN.
+
+### Option B: AWS Secrets Manager
+
+```bash
+aws secretsmanager create-secret \
+  --name "observe/ingest-token" \
+  --secret-string "<YOUR_INGEST_TOKEN>"
 ```
+
+```json
+{
+  "name": "TOKEN",
+  "valueFrom": "arn:aws:secretsmanager:<region>:<account_id>:secret:observe/ingest-token"
+}
+```
+
+The task execution role needs `secretsmanager:GetSecretValue` on that secret ARN.
 
 ---
 
-## Observability Outputs
+## Custom Config Delivery: SSM (ADOT Path)
 
-### Traces → AWS X-Ray
+If using vanilla ADOT (`amazon/aws-otel-collector`) instead of the Observe Agent, store the full collector YAML in SSM and inject via `AOT_CONFIG_CONTENT`:
 
-- Navigate to **AWS X-Ray** in the console.
-- View service maps, trace timelines, and latency distributions.
-- Auto-instrumented libraries (Express, HTTP, AWS SDK) produce spans automatically.
-- Traces carry X-Ray trace IDs compatible with `aws-xray-sdk` if you need mixed SDK usage.
+```bash
+aws ssm put-parameter \
+  --name "otel-collector-config" \
+  --type String \
+  --value "$(cat collector-config.yaml)"
+```
 
-### Metrics → CloudWatch
+In the ADOT container definition:
 
-Two metric destinations depending on config:
+```json
+{
+  "name": "AOT_CONFIG_CONTENT",
+  "valueFrom": "otel-collector-config"
+}
+```
 
-| Namespace | Source | Data |
-|---|---|---|
-| `ECS/ContainerInsights` | `awsecscontainermetrics` receiver | CPU, memory, network, storage per task/container |
-| `MyApp/NodeJS` (custom) | OTLP metrics from your Node.js app | `http.server.duration`, custom business metrics |
+This avoids rebuilding the collector image when config changes.
 
-The `awsemf` exporter writes metrics as CloudWatch Embedded Metric Format (EMF) log events. CloudWatch automatically extracts these as metrics — no separate `PutMetricData` API calls.
+---
 
-### CloudWatch Application Signals (Optional)
+## Observe Data Model: What You Get
 
-ADOT auto-instrumentation is compatible with **CloudWatch Application Signals**, which provides a unified application health dashboard (SLOs, RED metrics, service map) without any additional SDK configuration. Enable it in the ECS console or by setting the appropriate ADOT config mode.
+### Traces → APM / Trace Explorer
+
+- Full distributed traces with spans, span events, and span links stored in separate normalized datasets.
+- Auto-instrumented Express routes produce spans with `http.method`, `http.route`, `http.status_code`, `http.url`.
+- Resource attributes (service name, ECS task ARN, cluster, region) become `resource_attributes` in Observe.
+- Span attributes become `attributes`.
+- View in **APM > Trace Explorer** or **APM > Service Management**.
+
+### Metrics → Metrics Explorer
+
+- OTLP metrics are stored with `metric`, `type`, `value`, `unit`, `attributes`, and `resource_attributes` columns.
+- ECS container metrics from `awsecscontainermetrics` arrive prefixed with `ecs.task.*` and `container.*`.
+- OpenTelemetry runtime metrics from Node.js auto-instrumentation include `http.server.duration`, `nodejs.eventloop.utilization`, `v8js.gc.duration`.
+- **Histogram note:** Cumulative histograms are not fully supported by Observe — prefer delta aggregation or use the upstream OTel SDK default (cumulative is the default; configure `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta` if hitting issues).
+
+### Logs → Log Explorer
+
+- Container stdout/stderr collected by the daemon filelog receiver appears in **Log Explorer**.
+- Structured JSON logs are parsed automatically.
+- Logs with `trace_id` and `span_id` fields are automatically correlated to traces in APM.
 
 ---
 
@@ -530,83 +733,56 @@ ADOT auto-instrumentation is compatible with **CloudWatch Application Signals**,
 
 | Scenario | Recommendation |
 |---|---|
-| Just traces | Built-in `ecs-default-config.yaml` + `OTEL_TRACES_SAMPLER=xray` |
-| Traces + container metrics | Built-in `container-insights/otel-task-metrics-config.yaml` |
-| Traces + app custom metrics | Custom config via SSM with separate OTLP metrics pipeline |
-| EC2 host metrics | Daemon service with `awscontainerinsightreceiver` or `hostmetrics` receiver |
-| Centralized sampling rules | `OTEL_TRACES_SAMPLER=xray` + X-Ray sampling rules in console |
-| Config changes without redeployment | SSM Parameter with `AOT_CONFIG_CONTENT` env var |
-
----
-
-## Community Patterns
-
-### Datadog via ADOT
-
-ADOT supports forwarding telemetry to Datadog using the `datadog` exporter, which can be added alongside the `awsxray` and `awsemf` exporters in a custom config. This allows a single ADOT sidecar to fan out to both AWS-native and third-party backends.
-
-```yaml
-exporters:
-  awsxray: {}
-  datadog:
-    api:
-      key: ${env:DD_API_KEY}
-      site: datadoghq.com
-service:
-  pipelines:
-    traces:
-      receivers: [otlp]
-      exporters: [awsxray, datadog]
-```
-
-### Dynatrace / New Relic / Honeycomb via OTLP Exporter
-
-These vendors accept standard OTLP. Use the `otlp` exporter targeting their ingestion endpoint:
-
-```yaml
-exporters:
-  otlp/honeycomb:
-    endpoint: api.honeycomb.io:443
-    headers:
-      x-honeycomb-team: ${env:HONEYCOMB_API_KEY}
-```
-
-### Splunk
-
-Splunk provides a dedicated ADOT partner config. See: https://aws-otel.github.io/docs/partners/splunk
+| Getting started fast | Observe Agent as sidecar + upstream OTel auto-instrumentation |
+| Already using ADOT | Keep ADOT image, swap exporters to `otlphttp` pointing at Observe |
+| Container logs collection | Observe Agent daemon service with `filelog/ecs` receiver + docker volume mounts |
+| EC2 host metrics | Observe Agent daemon with `host_monitoring.enabled: true` |
+| Secure token delivery | SSM SecureString with `valueFrom` in task definition |
+| Config changes without image rebuild | `OTEL_CONFIG_OVERRIDES` env var (Observe Agent) or SSM `AOT_CONFIG_CONTENT` (ADOT) |
+| Delta histogram metrics | Set `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta` on Node.js app |
 
 ---
 
 ## Key Gotchas and Considerations
 
-**Container startup order:** Always set `dependsOn` with `condition: START` on the ADOT collector. If the collector isn't listening when Node.js starts, initial spans will be dropped (OTLP exporters retry, but early spans may be lost).
+**Observe only accepts OTLP/HTTP at ingest.** The Observe ingest endpoint does not support gRPC. Your collector's exporter to Observe must be `otlphttp`, not `otlp` (which defaults to gRPC). The Observe Agent handles this transparently. With ADOT, explicitly use the `otlphttp` exporter component.
 
-**Bridge mode hostnames:** In `bridge` network mode, use `links` and the container name as the hostname (`aws-otel-collector`). Do not use `localhost` — that only works in `awsvpc` or `host` network modes.
+**Node.js → sidecar can use gRPC or HTTP.** The local app-to-sidecar leg can use either `4317` (gRPC) or `4318` (HTTP). The sidecar converts and forwards over HTTP to Observe. Use `http/protobuf` if you want to keep the full chain HTTP-only.
 
-**CloudWatch dimensions limit:** The `awsemf` exporter has a 9-dimension limit per metric per CloudWatch's EMF spec. Avoid sending dimension sets that exceed this limit.
+**Bridge mode hostnames.** In ECS EC2 bridge networking, containers in the same task communicate via Docker `links`. Set `OTEL_EXPORTER_OTLP_ENDPOINT=http://observe-agent:4318` using the container name. Do not use `localhost` — it only works in `awsvpc` or `host` network modes.
 
-**ECS agent version:** Verify your EC2 ECS AMI ships with agent v1.39.0+. The Task Metadata Endpoint V4 (required for `awsecscontainermetrics`) is not available on older agents. Check with:
-```bash
-curl $ECS_CONTAINER_METADATA_URI_V4/task
-```
+**Cumulative histogram warning.** Observe's metric storage doesn't correctly handle cumulative histograms (quantile calculations will be wrong). If your OTel SDK is emitting cumulative histograms (the default for most SDKs), set `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta` on your Node.js process.
 
-**Sampling in production:** Default 100% sampling (`1.0`) is fine for testing. For production, use X-Ray remote sampling rules or set `OTEL_TRACES_SAMPLER_ARG` to a lower ratio (e.g., `0.1` = 10%).
+**`x-observe-target-package` header.** This header routes telemetry to the correct Observe app package. Forgetting it means data arrives in a raw datastream but won't appear in the APM or Metrics UI automatically. The Observe Agent adds it for you. With a custom OTLP config, add it explicitly per exporter.
 
-**SSM vs baked config:** The SSM `AOT_CONFIG_CONTENT` approach is preferred for production because config changes don't require a task definition revision or redeployment — only a new task launch.
+**Token in plaintext env vars is fine for testing**, but use SSM SecureString or Secrets Manager for production. The Observe Agent supports `${TOKEN}` as a placeholder resolved from environment at runtime.
 
-**Node.js ESM apps:** If your app uses ES Modules (`type: "module"` in package.json), the `--require` flag may not work. Use `--experimental-loader=@opentelemetry/instrumentation/hook.mjs` instead. CJS apps are fully supported.
+**`OTEL_CONFIG_OVERRIDES` must be a single env var.** When using the Observe Agent's `OTEL_CONFIG_OVERRIDES` override mechanism (as an alternative to baked image config), the entire YAML must be passed as a single environment variable value — not split across multiple vars with `::` delimiters. Splitting silently fails.
+
+**ECS agent version.** The `awsecscontainermetrics` receiver requires ECS agent v1.39.0+. Verify with `curl $ECS_CONTAINER_METADATA_URI_V4/task` on the host — if it returns data, V4 is available.
+
+**Image rate limits.** The Observe Agent image is on Docker Hub (`observeinc/observe-agent`). ECS can be rate-limited by Docker Hub in production. Configure an ECR pull-through cache or build and push to your own ECR repo (the build approach in Step 4 already does this).
 
 ---
 
 ## Reference Links
 
+### Observe Inc Docs
+- [Install on Amazon ECS (EC2)](https://docs.observeinc.com/docs/amazon-ecs-ec2)
+- [Install on Amazon ECS (Fargate - Sidecar Pattern)](https://docs.observeinc.com/docs/install-on-amazon-ecs-fargate-sidecar-pattern)
+- [Send Node.js application data to Observe](https://docs.observeinc.com/docs/send-nodejs-application-data-to-observe)
+- [Instrument your Node.js application on a host](https://docs.observeinc.com/docs/instrument-your-nodejs-application)
+- [Configure your own OTel collector (non-Kubernetes)](https://docs.observeinc.com/docs/configure-your-own-otel-collector-in-a-non-kubernetes-environment)
+- [OpenTelemetry Endpoint Reference](https://docs.observeinc.com/docs/opentelemetry)
+- [APM Instrumentation Overview](https://docs.observeinc.com/docs/apm-instrumentation)
+
+### AWS / ADOT Docs
 - [ADOT ECS Setup Overview](https://aws-otel.github.io/docs/setup/ecs)
 - [ADOT ECS EC2 Task Definition](https://aws-otel.github.io/docs/setup/ecs/task-definition-for-ecs-ec2)
-- [ADOT JavaScript SDK Auto-Instrumentation](https://aws-otel.github.io/docs/getting-started/js-sdk/trace-metric-auto-instr)
 - [ECS Container Metrics Receiver](https://aws-otel.github.io/docs/components/ecs-metrics-receiver)
-- [Custom Config via SSM](https://aws-otel.github.io/docs/setup/ecs/config-through-ssm)
-- [IAM Policy](https://aws-otel.github.io/docs/setup/ecs/create-iam-policy)
-- [IAM Roles](https://aws-otel.github.io/docs/setup/ecs/create-iam-role)
+- [Custom Config via SSM (ADOT)](https://aws-otel.github.io/docs/setup/ecs/config-through-ssm)
 - [Official EC2 Sidecar Task Definition JSON](https://github.com/aws-observability/aws-otel-collector/blob/master/examples/ecs/aws-cloudwatch/ecs-ec2-sidecar.json)
-- [ADOT JS Sample App (Express)](https://github.com/aws-observability/aws-otel-js-instrumentation/tree/main/sample-applications/simple-express-server)
+
+### OpenTelemetry Docs
 - [OpenTelemetry JS Node.js Getting Started](https://opentelemetry.io/docs/languages/js/getting-started/nodejs/)
+- [ADOT JavaScript SDK Auto-Instrumentation](https://aws-otel.github.io/docs/getting-started/js-sdk/trace-metric-auto-instr)
